@@ -1,0 +1,1124 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════
+// LuLevels — Session & Liquidity Suite                                    v1.0.0
+// -------------------------------------------------------------------------------
+// Original implementation of widely discussed session / liquidity concepts.
+// Not affiliated with, derived from, or claimed equivalent to any third-party
+// product. Contextual levels only: no buy/sell rules, no performance claims.
+//
+// Definitions used by this script (see tradingview/README.md for full detail):
+//   RTH opening gap  : prev-close = close of the LAST chart bar inside the previous
+//                      RTH window; open = open of the FIRST chart bar of the current
+//                      RTH window. Never the daily settlement.
+//   NDOG             : close of the last bar before the trading-day rollover vs the
+//                      open of the first bar after it.
+//   NWOG             : close of the last bar of the prior week vs the open of the
+//                      first bar of the new week (weekly-bar rollover).
+//   FVG (3-candle)   : bullish low > high[2]; bearish high < low[2]; confirmed when
+//                      the third candle closes; detected on the CHART timeframe.
+//   Sweep            : trades beyond a completed level by >= N ticks and CLOSES back
+//                      on the original side in the same bar. Touch = trades at/through.
+//                      Break = closes through.
+// ═══════════════════════════════════════════════════════════════════════════════
+indicator("LuLevels — Session & Liquidity Suite", shorttitle = "LuLevels", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+SCRIPT_VERSION = "1.0.0"
+DAYS           = ":1234567"
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Inputs
+// ───────────────────────────────────────────────────────────────────────────────
+G_DISP = "Display"
+G_CLK  = "Session clock — US equity-session preset"
+G_LIQ  = "Session liquidity"
+G_OG   = "RTH open & opening gap"
+G_FVG  = "First presented FVG"
+G_MAC  = "Macro windows"
+G_DOG  = "New-day / new-week opening gaps"
+G_DASH = "Dashboard"
+G_DXY  = "DXY context"
+G_ALR  = "Alerts"
+
+preset    = input.string("Standard", "Display preset", options = ["Minimal", "Standard", "Detailed"], group = G_DISP, tooltip = "Minimal: RTH open/close + gap CE, first FVG, live liquidity of the latest session only.\nStandard: adds session boxes, gap 25/75% levels, macro boxes, NDOG/NWOG, sweep markers and history.\nDetailed: adds prices on labels, macro range text and extra dashboard rows.\nModule toggles below still apply in every preset.")
+themeIn   = input.string("Auto", "Theme", options = ["Auto", "Dark", "Light"], group = G_DISP, tooltip = "Auto reads the chart background colour.")
+lblSizeIn = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], group = G_DISP)
+lineW     = input.int(1, "Active line width", minval = 1, maxval = 4, group = G_DISP)
+histKeep  = input.int(3, "Historical sessions kept", minval = 0, maxval = 15, group = G_DISP, tooltip = "How many completed sessions / gaps / FVGs stay on the chart (faded, dotted) besides the current one. Minimal preset forces 0.")
+railOff   = input.int(8, "Label rail offset (bars)", minval = 1, maxval = 60, group = G_DISP, tooltip = "Active-level labels are stacked in one rail to the right of the last bar.")
+mergeFrac = input.float(0.20, "Merge labels closer than (× ATR14)", minval = 0.0, step = 0.05, group = G_DISP, tooltip = "Labels whose prices are within this distance are combined into one chip (e.g. 'AS H · PDH') to prevent overlap. 0 disables merging.")
+
+tz        = input.string("America/New_York", "Session timezone (IANA)", group = G_CLK, tooltip = "All session, macro and open times are interpreted in this zone. Daylight-saving changes are handled by TradingView's time-zone database. The defaults are a US EQUITY-SESSION preset (RTH 09:30–16:00 ET).")
+rthIn     = input.session("0930-1600", "RTH session", group = G_CLK, tooltip = "Regular trading hours. Defines the RTH open, previous RTH close, opening gap, first presented FVG and previous-session high/low.")
+
+showRTHLiq = input.bool(true, "Previous RTH session high / low", group = G_LIQ)
+showAsia   = input.bool(true, "", inline = "as", group = G_LIQ)
+asiaIn     = input.session("2000-0000", "Asia", inline = "as", group = G_LIQ)
+showLon    = input.bool(true, "", inline = "lo", group = G_LIQ)
+lonIn      = input.session("0200-0500", "London", inline = "lo", group = G_LIQ)
+showPre    = input.bool(true, "", inline = "pm", group = G_LIQ)
+preIn      = input.session("0400-0930", "Pre-market (US equities)", inline = "pm", group = G_LIQ)
+showON     = input.bool(false, "", inline = "on", group = G_LIQ)
+onIn       = input.session("1800-0930", "Overnight (futures ETH)", inline = "on", group = G_LIQ, tooltip = "Futures overnight / electronic session high-low. Kept separate from Asia, London and Pre-market.")
+showPD     = input.bool(true, "Prior trading-day high / low", group = G_LIQ, tooltip = "From the symbol's own DAILY bars (exchange trading day). For CME futures that is the 18:00–17:00 ET Globex day, not the calendar day and not RTH.")
+showBoxes  = input.bool(true, "Session range boxes", group = G_LIQ)
+showDev    = input.bool(true, "Label developing extremes (~)", group = G_LIQ, tooltip = "Developing session highs/lows update live and are tagged with '~'. They become fixed liquidity levels only when the session window has fully closed.")
+sweepTicks = input.int(1, "Sweep: minimum penetration (ticks)", minval = 0, group = G_LIQ, tooltip = "Sweep = bar trades beyond the level by at least this many ticks AND closes back on the original side. A close through the level is a 'break', not a sweep.")
+
+showOG      = input.bool(true, "RTH open, previous RTH close & gap", group = G_OG)
+showOGQ     = input.bool(true, "Gap 25% / 75% levels", group = G_OG)
+gapMinTicks = input.int(1, "Treat gaps smaller than (ticks) as flat", minval = 0, group = G_OG)
+
+showFVG    = input.bool(true, "First presented FVG", group = G_FVG)
+fvgRule    = input.string("All 3 candles inside RTH", "Candle rule", options = ["All 3 candles inside RTH", "Candle 1 may precede the open"], group = G_FVG, tooltip = "All 3: candle 1 must be the RTH opening bar or later.\nCandle 1 may precede: candles 2 and 3 must be inside RTH; candle 1 may be the last pre-open bar.")
+fvgWin     = input.int(0, "Search window (minutes after open, 0 = whole RTH)", minval = 0, group = G_FVG, tooltip = "Measured to the OPEN time of the confirming (third) candle.")
+fvgMinMode = input.string("Ticks", "Minimum size unit", options = ["Ticks", "% of price", "ATR(14) multiple"], group = G_FVG)
+fvgMinVal  = input.float(2.0, "Minimum size", minval = 0.0, step = 0.5, group = G_FVG)
+fvgMitig   = input.string("Full fill (close)", "Mitigated when", options = ["Touch", "Midpoint (CE)", "Full fill (wick)", "Full fill (close)"], group = G_FVG, tooltip = "Evaluated on closed bars after the confirming candle.\nTouch: price enters the gap. CE: price reaches 50%. Full (wick): price trades through the far edge. Full (close): a bar closes beyond the far edge.")
+fvgMaxTF   = input.int(15, "Max detection timeframe (minutes)", minval = 1, group = G_FVG, tooltip = "The FVG is always detected on the CHART timeframe. Above this timeframe the module reports 'Unsupported' instead of guessing.")
+
+showMac = input.bool(true, "Macro windows", group = G_MAC, tooltip = "Configurable time windows. Developing high/low update live; a 'completed' event fires when the window's last bar closes.")
+m1On = input.bool(true, "", inline = "m1", group = G_MAC)
+m1In = input.session("0850-0910", "Macro 1", inline = "m1", group = G_MAC)
+m2On = input.bool(true, "", inline = "m2", group = G_MAC)
+m2In = input.session("0950-1010", "Macro 2", inline = "m2", group = G_MAC)
+m3On = input.bool(true, "", inline = "m3", group = G_MAC)
+m3In = input.session("1050-1110", "Macro 3", inline = "m3", group = G_MAC)
+m4On = input.bool(true, "", inline = "m4", group = G_MAC)
+m4In = input.session("1150-1210", "Macro 4", inline = "m4", group = G_MAC)
+m5On = input.bool(true, "", inline = "m5", group = G_MAC)
+m5In = input.session("1310-1340", "Macro 5", inline = "m5", group = G_MAC)
+m6On = input.bool(true, "", inline = "m6", group = G_MAC)
+m6In = input.session("1515-1545", "Macro 6", inline = "m6", group = G_MAC)
+
+showNDOG = input.bool(true, "New Day Opening Gap (NDOG)", group = G_DOG)
+showNWOG = input.bool(true, "New Week Opening Gap (NWOG)", group = G_DOG)
+dayMode  = input.string("Exchange trading day", "Day rollover", options = ["Exchange trading day", "Custom day session"], group = G_DOG, tooltip = "Exchange trading day: the symbol's daily-bar boundary (CME index futures: 17:00 close → 18:00 ET open).\nCustom: the first bar of the session below starts a new day (use for stocks/FX if the exchange day is not what you want).\nNWOG always uses the symbol's weekly-bar boundary.")
+dayIn    = input.session("1800-1700", "Custom day session", group = G_DOG)
+ndogKeep = input.int(3, "NDOGs kept", minval = 1, maxval = 10, group = G_DOG)
+nwogKeep = input.int(2, "NWOGs kept", minval = 1, maxval = 10, group = G_DOG)
+
+showDash   = input.bool(true, "Show dashboard", group = G_DASH)
+dashPosIn  = input.string("Top right", "Position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = G_DASH)
+dashSizeIn = input.string("Small", "Text size", options = ["Tiny", "Small", "Normal"], group = G_DASH)
+dOpMid     = input.bool(true, "Price vs midnight open (00:00)", group = G_DASH)
+dOpDay     = input.bool(true, "Price vs exchange-day open", group = G_DASH)
+dOpRTH     = input.bool(true, "Price vs RTH open", group = G_DASH)
+dOpWk      = input.bool(true, "Price vs week open", group = G_DASH)
+dOpCus     = input.bool(false, "Price vs custom open", inline = "co", group = G_DASH)
+cusH       = input.int(8, "", minval = 0, maxval = 23, inline = "co", group = G_DASH)
+cusM       = input.int(30, ":", minval = 0, maxval = 59, inline = "co", group = G_DASH, tooltip = "Hour : minute in the session timezone. Shows N/A if the chart has no bar starting exactly at that time.")
+
+showDXY     = input.bool(true, "DXY context", group = G_DXY)
+dxySym      = input.symbol("TVC:DXY", "Symbol", group = G_DXY, tooltip = "Any dollar-index feed available to your account, e.g. TVC:DXY or ICEUS:DX1!. Shows N/A if the symbol is unavailable.")
+dxyAnchorIn = input.string("Midnight 00:00", "Intraday reference open", options = ["Midnight 00:00", "08:30", "09:30"], group = G_DXY)
+dxyFlat     = input.float(0.05, "Neutral band (± %)", minval = 0.0, step = 0.01, group = G_DXY, tooltip = "Custom price-relative-to-open interpretation:\nchange% = (DXY close − reference open) / reference open × 100\nUp if change% > band, Down if < −band, otherwise Flat. Not a reproduction of any third-party formula.")
+
+alFVG     = input.bool(true, "First presented FVG confirmed", group = G_ALR)
+alSweep   = input.bool(true, "Liquidity sweep", group = G_ALR)
+alTouch   = input.bool(false, "Liquidity touch", group = G_ALR)
+alBreak   = input.bool(false, "Liquidity break (close through)", group = G_ALR)
+alGapCE   = input.bool(true, "Gap midpoint (CE) touch", group = G_ALR)
+alGapFill = input.bool(true, "Gap full fill", group = G_ALR)
+alGapKind = input.string("RTH + NDOG + NWOG", "Gap alerts apply to", options = ["RTH gap only", "RTH + NDOG + NWOG"], group = G_ALR)
+alMacro   = input.bool(true, "Macro range completed", group = G_ALR)
+alTiming  = input.string("Bar close", "Touch-type event timing", options = ["Bar close", "Intrabar (once per bar)"], group = G_ALR, tooltip = "Touch-type events: liquidity touch, gap CE touch, gap fill. Sweeps, breaks, FVGs and macro completions are ALWAYS confirmed on bar close.")
+alFmt     = input.string("Text", "Message format", options = ["Text", "JSON"], group = G_ALR)
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Derived settings & theme
+// ───────────────────────────────────────────────────────────────────────────────
+bool isMin      = preset == "Minimal"
+bool isDet      = preset == "Detailed"
+int  keepN      = isMin ? 0 : histKeep
+bool alIntrabar = alTiming == "Intrabar (once per bar)"
+bool alJson     = alFmt == "JSON"
+bool alAllGaps  = alGapKind == "RTH + NDOG + NWOG"
+bool tfOK       = timeframe.isintraday
+int  tfSec      = timeframe.in_seconds()
+
+bool drawBoxes  = showBoxes and not isMin
+bool drawMac    = showMac and not isMin
+bool drawOGQ    = showOGQ and not isMin
+bool drawDOG    = not isMin
+bool devLabels  = showDev and not isMin
+bool markSweeps = not isMin
+
+float bgLum  = 0.299 * color.r(chart.bg_color) + 0.587 * color.g(chart.bg_color) + 0.114 * color.b(chart.bg_color)
+bool  isDark = themeIn == "Dark" or (themeIn == "Auto" and bgLum < 128)
+
+color cBull  = isDark ? #22D3EE : #0891B2   // up / bullish objects (cyan)
+color cBear  = isDark ? #FB7185 : #E11D48   // down / bearish objects (rose)
+color cNeu   = isDark ? #94A3B8 : #64748B   // neutral / flat (slate)
+color cLiq   = isDark ? #60A5FA : #2563EB   // session liquidity (blue)
+color cAcc   = isDark ? #38BDF8 : #0284C7   // opening gaps (sky)
+color cMac   = isDark ? #818CF8 : #4F46E5   // macros / Asia (indigo)
+color cKey   = isDark ? #E2E8F0 : #334155   // prior-day levels
+color cWarn  = isDark ? #FBBF24 : #B45309   // data warnings only
+color cMut   = isDark ? #94A3B8 : #475569
+color cPanel = isDark ? color.new(#0B1220, 6) : color.new(#F8FAFC, 4)
+color cFrame = isDark ? #1E293B : #CBD5E1
+color cHist  = isDark ? color.new(#94A3B8, 55) : color.new(#64748B, 50)
+
+lblSize = switch lblSizeIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+dSize = switch dashSizeIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+dashPos = switch dashPosIn
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    => position.top_right
+
+int dxyAnchorMin = dxyAnchorIn == "08:30" ? 510 : dxyAnchorIn == "09:30" ? 570 : 0
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Time helpers
+// ───────────────────────────────────────────────────────────────────────────────
+f_minOfDay(int t) =>
+    hour(t, tz) * 60 + minute(t, tz)
+
+f_pStart(string s) =>
+    int(str.tonumber(str.substring(s, 0, 2))) * 60 + int(str.tonumber(str.substring(s, 2, 4)))
+
+f_pEnd(string s) =>
+    int(str.tonumber(str.substring(s, 5, 7))) * 60 + int(str.tonumber(str.substring(s, 7, 9)))
+
+f_dur(int a, int b) =>
+    int d = (b - a + 1440) % 1440
+    d == 0 ? 1440 : d
+
+f_sessLabel(string s) =>
+    str.substring(s, 0, 2) + ":" + str.substring(s, 2, 4) + "–" + str.substring(s, 5, 7) + ":" + str.substring(s, 7, 9)
+
+// Identifier of the session occurrence a bar belongs to: the timestamp of that
+// occurrence's start. Sessions crossing midnight map post-midnight bars to the
+// previous day's start. Used only to tell occurrences apart.
+f_anchor(int t, int startMin) =>
+    int base = timestamp(tz, year(t, tz), month(t, tz), dayofmonth(t, tz), math.floor(startMin / 60), startMin % 60)
+    f_minOfDay(t) >= startMin ? base : base - 86400000
+
+// Open of the bar that starts exactly at `targetMin` (session tz) on the current
+// calendar day; na until such a bar exists. Never substitutes a nearby bar.
+f_openAt(int targetMin) =>
+    var float o = na
+    if dayofmonth(time, tz) != dayofmonth(time[1], tz)
+        o := na
+    if f_minOfDay(time) == targetMin
+        o := open
+    o
+
+f_tfStr() =>
+    int m = timeframe.multiplier
+    timeframe.isseconds ? str.tostring(m) + "s" : timeframe.isminutes ? (m % 60 == 0 ? str.tostring(math.floor(m / 60)) + "h" : str.tostring(m) + "m") : timeframe.period
+
+f_hm(int ms) =>
+    int mins = math.max(0, math.floor(ms / 60000))
+    (mins >= 60 ? str.tostring(math.floor(mins / 60)) + "h " : "") + str.tostring(mins % 60) + "m"
+
+f_px(float x) =>
+    str.tostring(x, format.mintick)
+
+f_num(float x) =>
+    na(x) ? "null" : str.tostring(math.round_to_mintick(x), "#.##########")
+
+f_cat(string a, bool cond, string b) =>
+    cond ? (a == "" ? b : a + " · " + b) : a
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Alerts
+// ───────────────────────────────────────────────────────────────────────────────
+f_id(string ev, string tag, int anchor) =>
+    ev + "|" + syminfo.tickerid + "|" + str.replace_all(tag, " ", "_") + "|" + str.tostring(anchor)
+
+f_json(string ev, string detail, float lvl, string id, string extra) =>
+    '{"script":"LuLevels","version":"' + SCRIPT_VERSION + '","symbol":"' + syminfo.tickerid + '","timeframe":"' + timeframe.period + '","event":"' + ev + '","detail":"' + detail + '","level":' + f_num(lvl) + extra + ',"bar_time":' + str.tostring(time) + ',"event_id":"' + id + '"}'
+
+f_text(string ev, string detail, float lvl) =>
+    "LuLevels | " + syminfo.ticker + " " + f_tfStr() + " | " + ev + " | " + detail + (na(lvl) ? "" : " @ " + f_px(lvl))
+
+// touchType = true → may fire intrabar (once per bar) when the user selects it.
+f_fire(string ev, string detail, float lvl, string id, bool touchType, string extra) =>
+    string msg = alJson ? f_json(ev, detail, lvl, id, extra) : f_text(ev, detail, lvl)
+    if touchType and alIntrabar
+        alert(msg, alert.freq_once_per_bar)
+    else
+        alert(msg, alert.freq_once_per_bar_close)
+    true
+
+// Touch-type evaluation gate: bar close by default, every tick if intrabar mode.
+bool touchGate = alIntrabar or barstate.isconfirmed
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Types
+// ───────────────────────────────────────────────────────────────────────────────
+type Level
+    string tag
+    string name
+    float  price
+    bool   isHigh  = false
+    int    t0
+    int    tc
+    int    tEnd
+    bool   touched = false
+    bool   swept   = false
+    bool   broken  = false
+    bool   done    = false
+    color  col
+    line   ln
+    label  mk
+
+type Sess
+    string       kind
+    string       name
+    string       tag
+    int          startMin
+    int          durMin
+    bool         enabled     = false
+    bool         liq         = false
+    color        col
+    bool         active      = false
+    int          sid
+    int          lastSid
+    int          t0
+    int          t0Bar
+    int          endTs
+    float        hi
+    float        lo
+    int          hiT
+    int          loT
+    float        lastClose
+    int          lastTc
+    bool         exact       = false
+    bool         everStarted = false
+    float        pHi
+    float        pLo
+    int          pHiT
+    int          pLoT
+    float        pClose
+    int          pT0
+    int          pEnd
+    bool         pExact      = false
+    bool         hasDone     = false
+    box          bx
+    array<Level> levels
+    array<box>   hist
+
+type Gap
+    string kind
+    string tag
+    float  pc
+    float  op
+    float  top
+    float  bot
+    float  mid
+    float  q1
+    float  q3
+    bool   up     = false
+    bool   flat   = false
+    bool   live   = true
+    bool   ceHit  = false
+    bool   filled = false
+    int    t0
+    int    tEnd
+    color  col
+    box    zone
+    line   lMid
+    line   lQ1
+    line   lQ3
+    line   lOp
+    line   lPc
+
+type FVG
+    bool   bull    = false
+    float  top
+    float  bot
+    float  mid
+    int    t0
+    int    tc
+    int    tEnd
+    string state
+    bool   touched = false
+    bool   ceHit   = false
+    color  col
+    box    zone
+    line   lMid
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Session engine
+// ───────────────────────────────────────────────────────────────────────────────
+method finish(Sess s) =>
+    s.active  := false
+    s.pHi     := s.hi
+    s.pLo     := s.lo
+    s.pHiT    := s.hiT
+    s.pLoT    := s.loT
+    s.pClose  := s.lastClose
+    s.pT0     := s.t0
+    s.pEnd    := s.lastTc
+    s.pExact  := s.exact
+    s.hasDone := true
+
+// Returns [started, completed] for this bar.
+// A session completes on the close of the bar whose close time reaches the window
+// end, or (fallback) on the first bar that no longer belongs to the occurrence.
+method step(Sess s, bool inS) =>
+    bool started   = false
+    bool completed = false
+    if s.enabled
+        int sid = inS ? f_anchor(time, s.startMin) : na
+        if s.active and (not inS or sid != s.sid)
+            s.finish()
+            completed := true
+        if inS and not s.active and (na(s.lastSid) or sid != s.lastSid)
+            s.active      := true
+            s.sid         := sid
+            s.lastSid     := sid
+            s.t0          := time
+            s.t0Bar       := bar_index
+            s.endTs       := sid + s.durMin * 60000
+            s.hi          := high
+            s.lo          := low
+            s.hiT         := time
+            s.loT         := time
+            // exact = first bar starts on the window start AND bars tile the window
+            s.exact       := f_minOfDay(time) == s.startMin and tfSec <= s.durMin * 60 and (s.durMin * 60) % tfSec == 0
+            s.everStarted := true
+            started       := true
+        else if s.active
+            if high > s.hi
+                s.hi  := high
+                s.hiT := time
+            if low < s.lo
+                s.lo  := low
+                s.loT := time
+        if s.active
+            s.lastClose := close
+            s.lastTc    := time_close
+            if barstate.isconfirmed and not na(time_close) and time_close >= s.endTs
+                s.finish()
+                completed := true
+    [started, completed]
+
+f_mkSess(string kind, string name, string tag, string sessIn, bool en, bool liq, color col) =>
+    int sm = f_pStart(sessIn)
+    int em = f_pEnd(sessIn)
+    bool ok = en and tfOK and not na(sm) and not na(em)
+    Sess.new(kind = kind, name = name, tag = tag, startMin = sm, durMin = f_dur(sm, em), enabled = ok, liq = liq, col = col, levels = array.new<Level>(), hist = array.new<box>())
+
+f_lnHist(line ln, int tEnd) =>
+    if not na(ln)
+        line.set_x2(ln, tEnd)
+        line.set_style(ln, line.style_dotted)
+        line.set_color(ln, cHist)
+        line.set_width(ln, 1)
+    true
+
+// Session / macro range box. Developing box spans the full window and its
+// top/bottom follow the live extremes; completed boxes fade and are retained.
+f_sessDraw(Sess s, bool started, bool completed, bool draw, int keepBoxes) =>
+    if completed and not na(s.bx)
+        box.set_right(s.bx, s.pEnd)
+        box.set_top(s.bx, s.pHi)
+        box.set_bottom(s.bx, s.pLo)
+        box.set_bgcolor(s.bx, color.new(s.col, 95))
+        box.set_border_color(s.bx, color.new(s.col, 80))
+        box.set_border_style(s.bx, line.style_dotted)
+        s.hist.push(s.bx)
+        s.bx := na
+        while s.hist.size() > keepBoxes
+            box.delete(s.hist.shift())
+    if started and draw and s.exact
+        s.bx := box.new(s.t0, s.hi, s.endTs, s.lo, xloc = xloc.bar_time, bgcolor = color.new(s.col, 91), border_color = color.new(s.col, 60), border_width = 1, border_style = line.style_dashed, text = s.name, text_size = size.tiny, text_color = color.new(s.col, 25), text_halign = text.align_left, text_valign = text.align_top)
+    if s.active and not na(s.bx)
+        box.set_top(s.bx, s.hi)
+        box.set_bottom(s.bx, s.lo)
+    true
+
+// Converts a completed session into two fixed liquidity levels.
+f_spawnLevels(Sess s, int keepSess) =>
+    if s.liq and s.pExact and not na(s.pHi)
+        Level h = Level.new(tag = s.tag + " H", name = s.name + " high", price = s.pHi, isHigh = true, t0 = s.pHiT, tc = time, col = s.col)
+        Level l = Level.new(tag = s.tag + " L", name = s.name + " low", price = s.pLo, isHigh = false, t0 = s.pLoT, tc = time, col = s.col)
+        h.ln := line.new(s.pHiT, s.pHi, time, s.pHi, xloc = xloc.bar_time, color = s.col, width = lineW)
+        l.ln := line.new(s.pLoT, s.pLo, time, s.pLo, xloc = xloc.bar_time, color = s.col, width = lineW)
+        s.levels.push(h)
+        s.levels.push(l)
+        while s.levels.size() > (keepSess + 1) * 2
+            Level o = s.levels.shift()
+            line.delete(o.ln)
+            label.delete(o.mk)
+    true
+
+// Touch / sweep / break evaluation for a set of levels. Returns event counts.
+f_procLevels(array<Level> arr) =>
+    int   nT  = 0
+    int   nS  = 0
+    int   nB  = 0
+    float pen = sweepTicks * syminfo.mintick
+    for l in arr
+        if not l.done and time > l.tc
+            bool hit = l.isHigh ? high >= l.price : low <= l.price
+            if hit and not l.touched and touchGate
+                l.touched := true
+                nT += 1
+                if alTouch
+                    f_fire("LIQ_TOUCH", l.name, l.price, f_id("LIQ_TOUCH", l.tag, l.t0), true, "")
+            if barstate.isconfirmed
+                bool sw = l.isHigh ? (high >= l.price + pen and close < l.price) : (low <= l.price - pen and close > l.price)
+                bool br = l.isHigh ? close > l.price : close < l.price
+                if sw or br
+                    l.done   := true
+                    l.swept  := sw
+                    l.broken := br
+                    l.tEnd   := time
+                    f_lnHist(l.ln, time)
+                    if sw
+                        nS += 1
+                        if markSweeps and not na(l.ln)
+                            l.mk := label.new(time, l.price, "", xloc = xloc.bar_time, style = label.style_xcross, color = color.new(l.col, 10), size = size.tiny, tooltip = l.name + " swept @ " + f_px(l.price))
+                        if alSweep
+                            f_fire("LIQ_SWEEP", l.name, l.price, f_id("LIQ_SWEEP", l.tag, l.t0), false, "")
+                    else
+                        nB += 1
+                        if alBreak
+                            f_fire("LIQ_BREAK", l.name, l.price, f_id("LIQ_BREAK", l.tag, l.t0), false, "")
+    [nT, nS, nB]
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Gap helpers (RTH opening gap, NDOG, NWOG)
+// ───────────────────────────────────────────────────────────────────────────────
+f_gapNew(string kind, string tag, float pc, float op, color colUp, color colDn, bool draw, bool quarters, bool opPc) =>
+    float top = math.max(pc, op)
+    float bot = math.min(pc, op)
+    float rng = top - bot
+    bool  fl  = rng == 0 or rng < gapMinTicks * syminfo.mintick
+    color gc  = fl ? cNeu : op > pc ? colUp : colDn
+    Gap g = Gap.new(kind = kind, tag = tag, pc = pc, op = op, top = top, bot = bot, mid = bot + rng * 0.5, q1 = bot + rng * 0.25, q3 = bot + rng * 0.75, up = op > pc, flat = fl, t0 = time, col = gc)
+    if draw and not fl
+        g.zone := box.new(time, top, time, bot, xloc = xloc.bar_time, bgcolor = color.new(gc, 88), border_color = color.new(gc, 100), border_width = 1)
+        g.lMid := line.new(time, g.mid, time, g.mid, xloc = xloc.bar_time, color = gc, width = lineW, style = line.style_dashed)
+        if quarters
+            g.lQ1 := line.new(time, g.q1, time, g.q1, xloc = xloc.bar_time, color = color.new(gc, 45), width = 1, style = line.style_dotted)
+            g.lQ3 := line.new(time, g.q3, time, g.q3, xloc = xloc.bar_time, color = color.new(gc, 45), width = 1, style = line.style_dotted)
+    if draw and opPc
+        g.lOp := line.new(time, op, time, op, xloc = xloc.bar_time, color = gc, width = lineW)
+        g.lPc := line.new(time, pc, time, pc, xloc = xloc.bar_time, color = cNeu, width = lineW)
+    g
+
+f_gapRetire(Gap g, int tEnd) =>
+    g.live := false
+    g.tEnd := tEnd
+    if not na(g.zone)
+        box.set_right(g.zone, tEnd)
+        box.set_bgcolor(g.zone, color.new(g.col, 95))
+    f_lnHist(g.lMid, tEnd)
+    f_lnHist(g.lQ1, tEnd)
+    f_lnHist(g.lQ3, tEnd)
+    f_lnHist(g.lOp, tEnd)
+    f_lnHist(g.lPc, tEnd)
+    true
+
+f_gapKill(Gap g) =>
+    box.delete(g.zone)
+    line.delete(g.lMid)
+    line.delete(g.lQ1)
+    line.delete(g.lQ3)
+    line.delete(g.lOp)
+    line.delete(g.lPc)
+    true
+
+f_purgeGaps(array<Gap> a, int maxN) =>
+    while a.size() > maxN
+        f_gapKill(a.shift())
+    true
+
+f_retireLive(array<Gap> a, int tEnd) =>
+    for g in a
+        if g.live
+            f_gapRetire(g, tEnd)
+    true
+
+f_extendGap(Gap g, int x) =>
+    if not na(g.zone)
+        box.set_right(g.zone, x)
+    if not na(g.lMid)
+        line.set_x2(g.lMid, x)
+    if not na(g.lQ1)
+        line.set_x2(g.lQ1, x)
+    if not na(g.lQ3)
+        line.set_x2(g.lQ3, x)
+    if not na(g.lOp)
+        line.set_x2(g.lOp, x)
+    if not na(g.lPc)
+        line.set_x2(g.lPc, x)
+    true
+
+// CE touch: bar range contains the 50% level (the opening bar counts).
+// Fill: price reaches the previous close (gap up: low <= pc; gap down: high >= pc).
+f_procGaps(array<Gap> arr, bool alertOn) =>
+    int nCE   = 0
+    int nFill = 0
+    for g in arr
+        if g.live and not g.flat and touchGate and time >= g.t0
+            if not g.ceHit and low <= g.mid and high >= g.mid
+                g.ceHit := true
+                nCE += 1
+                if not na(g.lMid)
+                    line.set_style(g.lMid, line.style_solid)
+                if alertOn and alGapCE
+                    f_fire("GAP_CE_TOUCH", g.kind + " midpoint", g.mid, f_id("GAP_CE_TOUCH", g.tag, g.t0), true, ',"gap_top":' + f_num(g.top) + ',"gap_bottom":' + f_num(g.bot))
+            if not g.filled and (g.up ? low <= g.pc : high >= g.pc)
+                g.filled := true
+                nFill += 1
+                if not na(g.zone)
+                    box.set_bgcolor(g.zone, color.new(g.col, 95))
+                if alertOn and alGapFill
+                    f_fire("GAP_FILL", g.kind + " filled", g.pc, f_id("GAP_FILL", g.tag, g.t0), true, ',"gap_top":' + f_num(g.top) + ',"gap_bottom":' + f_num(g.bot))
+    [nCE, nFill]
+
+f_gapState(array<Gap> a) =>
+    if a.size() == 0
+        "—"
+    else
+        Gap g = a.last()
+        g.flat ? "Flat" : (g.up ? "Up " : "Down ") + f_px(g.top - g.bot) + " · CE " + (g.ceHit ? "✓" : "–") + " · Fill " + (g.filled ? "✓" : "–")
+
+f_fvgRetire(FVG f, int tEnd) =>
+    f.tEnd := tEnd
+    if not na(f.zone)
+        box.set_right(f.zone, tEnd)
+        box.set_bgcolor(f.zone, color.new(f.col, 94))
+        box.set_border_color(f.zone, cHist)
+        box.set_border_style(f.zone, line.style_dotted)
+    f_lnHist(f.lMid, tEnd)
+    true
+
+// ───────────────────────────────────────────────────────────────────────────────
+// State
+// ───────────────────────────────────────────────────────────────────────────────
+var Sess sRTH  = f_mkSess("SESSION", "RTH", "RTH", rthIn, true, showRTHLiq, cBull)
+var Sess sAsia = f_mkSess("SESSION", "Asia", "AS", asiaIn, showAsia, true, cMac)
+var Sess sLon  = f_mkSess("SESSION", "London", "LO", lonIn, showLon, true, cLiq)
+var Sess sPre  = f_mkSess("SESSION", "Pre-market", "PM", preIn, showPre, true, cAcc)
+var Sess sON   = f_mkSess("SESSION", "Overnight", "ON", onIn, showON, true, cNeu)
+var Sess sDay  = f_mkSess("DAY", "Custom day", "DAY", dayIn, dayMode == "Custom day session", false, cNeu)
+var Sess sM1   = f_mkSess("MACRO", f_sessLabel(m1In), "M1", m1In, showMac and m1On, false, cMac)
+var Sess sM2   = f_mkSess("MACRO", f_sessLabel(m2In), "M2", m2In, showMac and m2On, false, cMac)
+var Sess sM3   = f_mkSess("MACRO", f_sessLabel(m3In), "M3", m3In, showMac and m3On, false, cMac)
+var Sess sM4   = f_mkSess("MACRO", f_sessLabel(m4In), "M4", m4In, showMac and m4On, false, cMac)
+var Sess sM5   = f_mkSess("MACRO", f_sessLabel(m5In), "M5", m5In, showMac and m5On, false, cMac)
+var Sess sM6   = f_mkSess("MACRO", f_sessLabel(m6In), "M6", m6In, showMac and m6On, false, cMac)
+
+var array<Sess> liqS = array.new<Sess>()
+var array<Sess> macS = array.new<Sess>()
+if barstate.isfirst
+    liqS.push(sRTH)
+    liqS.push(sAsia)
+    liqS.push(sLon)
+    liqS.push(sPre)
+    liqS.push(sON)
+    macS.push(sM1)
+    macS.push(sM2)
+    macS.push(sM3)
+    macS.push(sM4)
+    macS.push(sM5)
+    macS.push(sM6)
+
+var array<Gap>   ogs    = array.new<Gap>()
+var array<Gap>   ndogs  = array.new<Gap>()
+var array<Gap>   nwogs  = array.new<Gap>()
+var array<FVG>   fvgs   = array.new<FVG>()
+var array<Level> pdLv   = array.new<Level>()
+var array<label> rail   = array.new<label>()
+var int          fvgPhase = 0         // 0 waiting · 1 searching · 2 found · 3 none this session · -1 unsupported
+var float        rthOpen  = na
+var bool         ogUnsup  = false
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Series that must be computed on every bar (global scope)
+// ───────────────────────────────────────────────────────────────────────────────
+bool inRTH  = not na(time(timeframe.period, rthIn + DAYS, tz))
+bool inAsia = not na(time(timeframe.period, asiaIn + DAYS, tz))
+bool inLon  = not na(time(timeframe.period, lonIn + DAYS, tz))
+bool inPre  = not na(time(timeframe.period, preIn + DAYS, tz))
+bool inON   = not na(time(timeframe.period, onIn + DAYS, tz))
+bool inDay  = not na(time(timeframe.period, dayIn + DAYS, tz))
+bool inM1   = not na(time(timeframe.period, m1In + DAYS, tz))
+bool inM2   = not na(time(timeframe.period, m2In + DAYS, tz))
+bool inM3   = not na(time(timeframe.period, m3In + DAYS, tz))
+bool inM4   = not na(time(timeframe.period, m4In + DAYS, tz))
+bool inM5   = not na(time(timeframe.period, m5In + DAYS, tz))
+bool inM6   = not na(time(timeframe.period, m6In + DAYS, tz))
+
+bool  chgD  = timeframe.change("D")
+bool  chgW  = timeframe.change("W")
+float prevC = close[1]
+float atr14 = ta.atr(14)
+
+float oMid = f_openAt(0)
+float oCus = f_openAt(cusH * 60 + cusM)
+var float oDay = na
+var float oWk  = na
+if chgD
+    oDay := open
+if chgW
+    oWk := open
+
+// Prior exchange trading-day high/low — non-repainting idiom ([1] + lookahead_on).
+[pdH, pdL, pdT] = request.security(syminfo.tickerid, "D", [high[1], low[1], time[1]], lookahead = barmerge.lookahead_on)
+
+// DXY context, evaluated in the DXY symbol's own bars at the chart timeframe.
+f_dxyCtx(int anchorMin) =>
+    var float dOpen = na
+    if timeframe.change("D")
+        dOpen := open
+    float aOpen = f_openAt(anchorMin)
+    [close, aOpen, dOpen]
+
+[dxC, dxA, dxD] = request.security(showDXY ? dxySym : syminfo.tickerid, timeframe.period, f_dxyCtx(dxyAnchorMin), ignore_invalid_symbol = true)
+
+// FVG candidates (chart timeframe)
+float fvgMin  = fvgMinMode == "Ticks" ? fvgMinVal * syminfo.mintick : fvgMinMode == "% of price" ? close * fvgMinVal / 100 : nz(atr14) * fvgMinVal
+bool  bullFVG = low > high[2] and (low - high[2]) >= fvgMin
+bool  bearFVG = high < low[2] and (low[2] - high) >= fvgMin
+bool  fvgTFOK = tfSec <= fvgMaxTF * 60
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 1 · Step all session trackers
+// ───────────────────────────────────────────────────────────────────────────────
+[rStart, rDone] = sRTH.step(inRTH)
+[aStart, aDone] = sAsia.step(inAsia)
+[lStart, lDone] = sLon.step(inLon)
+[pStart, pDone] = sPre.step(inPre)
+[oStart, oDone] = sON.step(inON)
+[dStart, dDone] = sDay.step(inDay)
+[m1S, m1D]      = sM1.step(inM1)
+[m2S, m2D]      = sM2.step(inM2)
+[m3S, m3D]      = sM3.step(inM3)
+[m4S, m4D]      = sM4.step(inM4)
+[m5S, m5D]      = sM5.step(inM5)
+[m6S, m6D]      = sM6.step(inM6)
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 2 · Session boxes & completed-session liquidity
+// ───────────────────────────────────────────────────────────────────────────────
+f_sessDraw(sRTH, rStart, rDone, false, keepN)
+f_sessDraw(sAsia, aStart, aDone, drawBoxes, keepN)
+f_sessDraw(sLon, lStart, lDone, drawBoxes, keepN)
+f_sessDraw(sPre, pStart, pDone, drawBoxes, keepN)
+f_sessDraw(sON, oStart, oDone, drawBoxes, keepN)
+if rDone
+    f_spawnLevels(sRTH, keepN)
+if aDone
+    f_spawnLevels(sAsia, keepN)
+if lDone
+    f_spawnLevels(sLon, keepN)
+if pDone
+    f_spawnLevels(sPre, keepN)
+if oDone
+    f_spawnLevels(sON, keepN)
+
+// Prior trading-day levels (available from the first bar of the new day).
+bool pdNew = tfOK and showPD and not na(pdT) and (na(pdT[1]) or pdT != pdT[1])
+if pdNew
+    Level h = Level.new(tag = "PDH", name = "Prior-day high", price = pdH, isHigh = true, t0 = time, tc = time - 1, col = cKey)
+    Level l = Level.new(tag = "PDL", name = "Prior-day low", price = pdL, isHigh = false, t0 = time, tc = time - 1, col = cKey)
+    h.ln := line.new(time, pdH, time, pdH, xloc = xloc.bar_time, color = cKey, width = lineW)
+    l.ln := line.new(time, pdL, time, pdL, xloc = xloc.bar_time, color = cKey, width = lineW)
+    pdLv.push(h)
+    pdLv.push(l)
+    while pdLv.size() > (keepN + 1) * 2
+        Level o = pdLv.shift()
+        line.delete(o.ln)
+        label.delete(o.mk)
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 3 · RTH open & opening gap
+// ───────────────────────────────────────────────────────────────────────────────
+if rStart
+    f_retireLive(ogs, time)
+    rthOpen := sRTH.exact ? open : na
+    ogUnsup := not sRTH.exact or (sRTH.hasDone and not sRTH.pExact)
+    if showOG and sRTH.exact and sRTH.hasDone and sRTH.pExact and not na(sRTH.pClose)
+        ogs.push(f_gapNew("RTH gap", "OG", sRTH.pClose, open, cBull, cBear, true, drawOGQ, true))
+        f_purgeGaps(ogs, keepN + 1)
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 4 · First presented FVG
+// ───────────────────────────────────────────────────────────────────────────────
+// Mitigation of existing FVGs (closed bars, after the confirming candle).
+if barstate.isconfirmed
+    for f in fvgs
+        if f.state == "Active" and time > f.tc
+            bool tch = f.bull ? low <= f.top : high >= f.bot
+            bool ce  = f.bull ? low <= f.mid : high >= f.mid
+            bool fw  = f.bull ? low <= f.bot : high >= f.top
+            bool fc  = f.bull ? close < f.bot : close > f.top
+            if tch
+                f.touched := true
+            if ce
+                f.ceHit := true
+            bool mit = switch fvgMitig
+                "Touch"            => tch
+                "Midpoint (CE)"    => ce
+                "Full fill (wick)" => fw
+                => fc
+            if mit
+                f.state := "Mitigated"
+                f_fvgRetire(f, time)
+
+bool evFVG = false
+if showFVG and tfOK and fvgPhase == 1 and inRTH and barstate.isconfirmed
+    int  need  = fvgRule == "All 3 candles inside RTH" ? 2 : 1
+    bool inWin = fvgWin == 0 or (time - sRTH.t0) < fvgWin * 60000
+    if inWin and bar_index - need >= sRTH.t0Bar and (bullFVG or bearFVG)
+        bool  isBull = bullFVG
+        color fcol   = isBull ? cBull : cBear
+        float ftop   = isBull ? low : low[2]
+        float fbot   = isBull ? high[2] : high
+        FVG f = FVG.new(bull = isBull, top = ftop, bot = fbot, mid = (ftop + fbot) / 2, t0 = time[2], tc = time, state = "Active", col = fcol)
+        f.zone := box.new(time[2], ftop, time, fbot, xloc = xloc.bar_time, bgcolor = color.new(fcol, 82), border_color = color.new(fcol, 45), border_width = 1)
+        f.lMid := line.new(time[2], f.mid, time, f.mid, xloc = xloc.bar_time, color = color.new(fcol, 15), width = 1, style = line.style_dotted)
+        fvgs.push(f)
+        while fvgs.size() > keepN + 1
+            FVG o = fvgs.shift()
+            box.delete(o.zone)
+            line.delete(o.lMid)
+        fvgPhase := 2
+        evFVG    := true
+        if alFVG
+            f_fire("FVG_CONFIRMED", (isBull ? "Bullish" : "Bearish") + " first presented FVG", f.mid, f_id("FVG_CONFIRMED", "FPFVG", f.tc), false, ',"fvg_top":' + f_num(ftop) + ',"fvg_bottom":' + f_num(fbot) + ',"direction":"' + (isBull ? "bull" : "bear") + '"')
+
+if rDone and fvgPhase == 1
+    fvgPhase := 3
+if rStart
+    for f in fvgs
+        if f.state == "Active"
+            f.state := "Expired"
+            f_fvgRetire(f, time)
+    fvgPhase := not showFVG ? 0 : (fvgTFOK and sRTH.exact) ? 1 : -1
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 5 · NDOG / NWOG
+// ───────────────────────────────────────────────────────────────────────────────
+bool newDay = dayMode == "Exchange trading day" ? chgD : dStart
+if tfOK and showNDOG and newDay and not na(prevC)
+    f_retireLive(ndogs, time)
+    ndogs.push(f_gapNew("NDOG", "NDOG", prevC, open, cAcc, cAcc, drawDOG, isDet, false))
+    f_purgeGaps(ndogs, isMin ? 1 : ndogKeep)
+if tfOK and showNWOG and chgW and not na(prevC)
+    f_retireLive(nwogs, time)
+    nwogs.push(f_gapNew("NWOG", "NWOG", prevC, open, cLiq, cLiq, drawDOG, isDet, false))
+    f_purgeGaps(nwogs, isMin ? 1 : nwogKeep)
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 6 · Events: liquidity, gaps, macros
+// ───────────────────────────────────────────────────────────────────────────────
+int evTouchN = 0
+int evSweepN = 0
+int evBreakN = 0
+for s in liqS
+    [nt, ns, nb] = f_procLevels(s.levels)
+    evTouchN += nt
+    evSweepN += ns
+    evBreakN += nb
+[pt, ps, pb] = f_procLevels(pdLv)
+evTouchN += pt
+evSweepN += ps
+evBreakN += pb
+
+[ogCE, ogFill] = f_procGaps(ogs, true)
+[ndCE, ndFill] = f_procGaps(ndogs, alAllGaps)
+[nwCE, nwFill] = f_procGaps(nwogs, alAllGaps)
+bool evCE   = ogCE > 0 or (alAllGaps and (ndCE > 0 or nwCE > 0))
+bool evFill = ogFill > 0 or (alAllGaps and (ndFill > 0 or nwFill > 0))
+
+f_macroProc(Sess m, bool started, bool done) =>
+    f_sessDraw(m, started, done, drawMac, keepN)
+    bool fired = false
+    if done and m.pExact
+        fired := true
+        if isDet and m.hist.size() > 0
+            box.set_text(m.hist.last(), m.name + "  " + f_px(m.pHi - m.pLo))
+        if alMacro
+            f_fire("MACRO_COMPLETE", "Macro " + m.name, m.pHi, f_id("MACRO_COMPLETE", m.tag, m.pT0), false, ',"high":' + f_num(m.pHi) + ',"low":' + f_num(m.pLo) + ',"window_start":' + str.tostring(m.pT0) + ',"window_end":' + str.tostring(m.pEnd))
+    fired
+
+bool mc1 = f_macroProc(sM1, m1S, m1D)
+bool mc2 = f_macroProc(sM2, m2S, m2D)
+bool mc3 = f_macroProc(sM3, m3S, m3D)
+bool mc4 = f_macroProc(sM4, m4S, m4D)
+bool mc5 = f_macroProc(sM5, m5S, m5D)
+bool mc6 = f_macroProc(sM6, m6S, m6D)
+bool evMacro = mc1 or mc2 or mc3 or mc4 or mc5 or mc6
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 7 · Label rail (last bar only): extend live drawings, merge nearby labels
+// ───────────────────────────────────────────────────────────────────────────────
+f_add(array<float> p, array<string> t, array<string> n, array<color> c, float px, string tag, string full, color col) =>
+    if not na(px)
+        p.push(px)
+        t.push(isDet ? tag + " " + f_px(px) : tag)
+        n.push(full + "  " + f_px(px))
+        c.push(col)
+    true
+
+f_railLbl(int x, float y, string tx, string tip, color col) =>
+    label.new(x, y, tx, xloc = xloc.bar_time, style = label.style_label_left, color = color.new(col, 84), textcolor = col, size = lblSize, tooltip = tip)
+
+if barstate.islast and tfOK
+    for lb in rail
+        label.delete(lb)
+    rail.clear()
+    int railX = time + railOff * tfSec * 1000
+
+    array<float>  rp = array.new<float>()
+    array<string> rt = array.new<string>()
+    array<string> rn = array.new<string>()
+    array<color>  rc = array.new<color>()
+
+    // Liquidity (fixed) and developing extremes
+    for s in liqS
+        for l in s.levels
+            if not l.done and not na(l.ln)
+                line.set_x2(l.ln, railX)
+                f_add(rp, rt, rn, rc, l.price, l.tag, l.name, l.col)
+        if devLabels and s.active and s.exact and s.liq
+            f_add(rp, rt, rn, rc, s.hi, s.tag + " H~", s.name + " high (developing)", s.col)
+            f_add(rp, rt, rn, rc, s.lo, s.tag + " L~", s.name + " low (developing)", s.col)
+    for l in pdLv
+        if not l.done and not na(l.ln)
+            line.set_x2(l.ln, railX)
+            f_add(rp, rt, rn, rc, l.price, l.tag, l.name, l.col)
+
+    // RTH open & gap
+    if showOG and ogs.size() > 0
+        Gap g = ogs.last()
+        if g.live
+            f_extendGap(g, railX)
+            f_add(rp, rt, rn, rc, g.op, "RTH O", "RTH open", g.col)
+            f_add(rp, rt, rn, rc, g.pc, "PC", "Previous RTH close", cNeu)
+            if not g.flat
+                f_add(rp, rt, rn, rc, g.mid, "OG CE", "Opening gap 50%", g.col)
+                if drawOGQ
+                    f_add(rp, rt, rn, rc, g.q1, "OG 25%", "Opening gap 25% (from bottom)", g.col)
+                    f_add(rp, rt, rn, rc, g.q3, "OG 75%", "Opening gap 75% (from bottom)", g.col)
+
+    // NDOG / NWOG
+    if drawDOG and ndogs.size() > 0
+        Gap g = ndogs.last()
+        if g.live and not g.flat
+            f_extendGap(g, railX)
+            f_add(rp, rt, rn, rc, g.mid, "NDOG CE", "New-day opening gap 50%", g.col)
+    if drawDOG and nwogs.size() > 0
+        Gap g = nwogs.last()
+        if g.live and not g.flat
+            f_extendGap(g, railX)
+            f_add(rp, rt, rn, rc, g.mid, "NWOG CE", "New-week opening gap 50%", g.col)
+
+    // First presented FVG
+    if fvgs.size() > 0
+        FVG f = fvgs.last()
+        if f.state == "Active"
+            box.set_right(f.zone, railX)
+            line.set_x2(f.lMid, railX)
+            f_add(rp, rt, rn, rc, f.mid, "FPFVG", (f.bull ? "Bullish" : "Bearish") + " first presented FVG 50%", f.col)
+
+    // Merge labels within threshold, place at group mean
+    int n = rp.size()
+    if n > 0
+        array<int> idx = array.sort_indices(rp, order.ascending)
+        float  thr    = nz(atr14) * mergeFrac
+        float  gFirst = na
+        float  gSum   = 0.0
+        int    gCnt   = 0
+        string gTx    = ""
+        string gTip   = ""
+        color  gCol   = cNeu
+        for i = 0 to n - 1
+            int   k  = idx.get(i)
+            float px = rp.get(k)
+            if gCnt > 0 and px - gFirst > thr
+                rail.push(f_railLbl(railX, gSum / gCnt, gTx, gTip, gCol))
+                gCnt := 0
+                gSum := 0.0
+            if gCnt == 0
+                gFirst := px
+                gCol   := rc.get(k)
+                gTx    := rt.get(k)
+                gTip   := rn.get(k)
+            else
+                gTx  := gTx + " · " + rt.get(k)
+                gTip := gTip + "\n" + rn.get(k)
+            gSum += px
+            gCnt += 1
+        rail.push(f_railLbl(railX, gSum / gCnt, gTx, gTip, gCol))
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 8 · Dashboard
+// ───────────────────────────────────────────────────────────────────────────────
+var table dash = table.new(dashPos, 2, 22, bgcolor = cPanel, frame_color = cFrame, frame_width = 1, border_width = 0)
+
+f_row(table t, int r, string k, string v, color vc) =>
+    table.cell(t, 0, r, k, text_color = cMut, text_halign = text.align_left, text_size = dSize)
+    table.cell(t, 1, r, v, text_color = vc, text_halign = text.align_right, text_size = dSize)
+    r + 1
+
+f_rel(float ref) =>
+    bool   ok  = not na(ref) and ref != 0
+    float  pct = ok ? (close - ref) / ref * 100 : na
+    string s   = not ok ? "N/A" : (close >= ref ? "▲ +" : "▼ ") + str.tostring(pct, "0.00") + "%" + (isDet ? "  " + f_px(ref) : "")
+    color  c   = not ok ? cMut : close > ref ? cBull : close < ref ? cBear : cNeu
+    [s, c]
+
+f_bias(float ref, float px) =>
+    bool   ok  = showDXY and not na(ref) and not na(px) and ref != 0
+    float  pct = ok ? (px - ref) / ref * 100 : na
+    string d   = not ok ? "" : pct > dxyFlat ? "Up " : pct < -dxyFlat ? "Down " : "Flat "
+    string s   = not ok ? "N/A" : d + (pct >= 0 ? "+" : "") + str.tostring(pct, "0.00") + "%"
+    color  c   = not ok ? cMut : pct > dxyFlat ? cBull : pct < -dxyFlat ? cBear : cNeu
+    [s, c]
+
+f_nearest(array<Level> arr, float upP0, string upT0, float dnP0, string dnT0) =>
+    float  upP = upP0
+    string upT = upT0
+    float  dnP = dnP0
+    string dnT = dnT0
+    for l in arr
+        if not l.done
+            if l.price > close and (na(upP) or l.price < upP)
+                upP := l.price
+                upT := l.tag
+            if l.price < close and (na(dnP) or l.price > dnP)
+                dnP := l.price
+                dnT := l.tag
+    [upP, upT, dnP, dnT]
+
+if barstate.islast and showDash
+    table.clear(dash, 0, 0, 1, 21)
+    table.cell(dash, 0, 0, "LuLevels", text_color = cBull, text_halign = text.align_left, text_size = dSize)
+    table.cell(dash, 1, 0, "v" + SCRIPT_VERSION + " · " + f_tfStr(), text_color = cMut, text_halign = text.align_right, text_size = dSize)
+    int r = 1
+    if not tfOK
+        r := f_row(dash, r, "Status", "Unsupported: use an intraday chart", cWarn)
+    else
+        // Session status
+        string ss = ""
+        ss := f_cat(ss, showAsia and inAsia, "Asia")
+        ss := f_cat(ss, showLon and inLon, "London")
+        ss := f_cat(ss, showPre and inPre, "Pre-mkt")
+        ss := f_cat(ss, inRTH, "RTH" + (isDet and sRTH.active ? " (" + f_hm(sRTH.endTs - timenow) + " left)" : ""))
+        ss := f_cat(ss, showON and inON, "Overnight")
+        r := f_row(dash, r, "Session", ss == "" ? "Off-session" : ss, ss == "" ? cMut : cBull)
+
+        // Macro status
+        string mt = ""
+        for m in macS
+            if m.active and m.exact
+                mt := m.name + " · live" + (isDet ? "  " + f_px(m.hi - m.lo) : "")
+        r := f_row(dash, r, "Macro", mt == "" ? "—" : mt, mt == "" ? cMut : cMac)
+
+        // Price relative to selected opens
+        if dOpRTH
+            [t1, c1] = f_rel(rthOpen)
+            r := f_row(dash, r, "vs RTH open", t1, c1)
+        if not isMin
+            if dOpMid
+                [t2, c2] = f_rel(oMid)
+                r := f_row(dash, r, "vs 00:00 open", t2, c2)
+            if dOpDay
+                [t3, c3] = f_rel(oDay)
+                r := f_row(dash, r, "vs exch-day open", t3, c3)
+            if dOpWk
+                [t4, c4] = f_rel(oWk)
+                r := f_row(dash, r, "vs week open", t4, c4)
+            if dOpCus
+                [t5, c5] = f_rel(oCus)
+                r := f_row(dash, r, "vs " + str.format("{0,number,00}:{1,number,00}", cusH, cusM) + " open", t5, c5)
+
+            // First presented FVG
+            if showFVG
+                string fs = fvgPhase == -1 ? "Unsupported (" + f_tfStr() + ")" : fvgPhase == 0 ? "Waiting for RTH" : fvgPhase == 1 ? "Searching…" : fvgPhase == 3 ? "None this session" : ""
+                color  fc = fvgPhase == -1 ? cWarn : cMut
+                if fvgPhase == 2 and fvgs.size() > 0
+                    FVG f = fvgs.last()
+                    fs := (f.bull ? "Bull · " : "Bear · ") + f.state + (f.ceHit ? " · CE ✓" : f.touched ? " · tested" : "")
+                    fc := f.state == "Active" ? f.col : cMut
+                r := f_row(dash, r, "FPFVG", fs, fc)
+
+            // RTH opening gap
+            if showOG
+                string gs = ogUnsup ? "Unsupported (" + f_tfStr() + ")" : f_gapState(ogs)
+                color  gc = ogUnsup ? cWarn : ogs.size() > 0 ? ogs.last().col : cMut
+                r := f_row(dash, r, "RTH gap", gs, gc)
+            if showNDOG
+                r := f_row(dash, r, "NDOG", f_gapState(ndogs), cAcc)
+            if showNWOG
+                r := f_row(dash, r, "NWOG", f_gapState(nwogs), cLiq)
+
+        // Nearest untouched liquidity (Detailed)
+        if isDet
+            float  upP = na
+            string upT = ""
+            float  dnP = na
+            string dnT = ""
+            for s in liqS
+                [a1, a2, a3, a4] = f_nearest(s.levels, upP, upT, dnP, dnT)
+                upP := a1
+                upT := a2
+                dnP := a3
+                dnT := a4
+            [b1, b2, b3, b4] = f_nearest(pdLv, upP, upT, dnP, dnT)
+            upP := b1
+            upT := b2
+            dnP := b3
+            dnT := b4
+            r := f_row(dash, r, "Liquidity ↑", na(upP) ? "—" : upT + "  " + f_px(upP) + " (+" + f_px(upP - close) + ")", na(upP) ? cMut : cLiq)
+            r := f_row(dash, r, "Liquidity ↓", na(dnP) ? "—" : dnT + "  " + f_px(dnP) + " (−" + f_px(close - dnP) + ")", na(dnP) ? cMut : cLiq)
+
+        // DXY context — custom price-relative-to-open interpretation
+        if showDXY
+            [dt1, dc1] = f_bias(dxA, dxC)
+            [dt2, dc2] = f_bias(dxD, dxC)
+            r := f_row(dash, r, "DXY vs " + (dxyAnchorMin == 0 ? "00:00" : dxyAnchorMin == 510 ? "08:30" : "09:30"), dt1, dc1)
+            r := f_row(dash, r, "DXY vs day open", dt2, dc2)
+
+        // Honest data / resolution notes
+        string unsup = ""
+        string nobar = ""
+        for s in liqS
+            if s.enabled and s.liq
+                if not s.everStarted
+                    nobar := f_cat(nobar, true, s.tag)
+                else if not s.exact
+                    unsup := f_cat(unsup, true, s.tag)
+        bool macBad = false
+        for m in macS
+            if m.enabled and m.everStarted and not m.exact
+                macBad := true
+        unsup := f_cat(unsup, macBad, "Macros")
+        unsup := f_cat(unsup, showFVG and fvgPhase == -1, "FVG")
+        string notes = (unsup == "" ? "" : "TF too coarse: " + unsup) + (nobar == "" ? "" : (unsup == "" ? "" : " | ") + "No bars: " + nobar) + (showDXY and na(dxC) ? (unsup == "" and nobar == "" ? "" : " | ") + "DXY N/A" : "")
+        if notes != ""
+            r := f_row(dash, r, "Data", notes, cWarn)
+        else if isDet
+            r := f_row(dash, r, "Data", "OK", cMut)
+
+// ───────────────────────────────────────────────────────────────────────────────
+// 9 · alertcondition() entries (for per-event alerts without JSON)
+//     Use "Any alert() function call" for the structured alert() messages.
+// ───────────────────────────────────────────────────────────────────────────────
+alertcondition(evFVG, "LuLevels · First presented FVG confirmed", "LuLevels: first presented FVG confirmed on {{ticker}} ({{interval}})")
+alertcondition(evSweepN > 0, "LuLevels · Liquidity sweep", "LuLevels: liquidity sweep on {{ticker}} ({{interval}})")
+alertcondition(evTouchN > 0, "LuLevels · Liquidity touch", "LuLevels: liquidity level touched on {{ticker}} ({{interval}})")
+alertcondition(evBreakN > 0, "LuLevels · Liquidity break", "LuLevels: liquidity level closed through on {{ticker}} ({{interval}})")
+alertcondition(evCE, "LuLevels · Gap CE touch", "LuLevels: gap midpoint touched on {{ticker}} ({{interval}})")
+alertcondition(evFill, "LuLevels · Gap filled", "LuLevels: gap filled on {{ticker}} ({{interval}})")
+alertcondition(evMacro, "LuLevels · Macro range completed", "LuLevels: macro window completed on {{ticker}} ({{interval}})")
